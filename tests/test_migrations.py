@@ -199,6 +199,84 @@ def test_fresh_and_legacy_databases_converge_to_same_structure(tmp_path):
     legacy.close()
 
 
+def test_v17_backfills_decision_snapshots_for_legacy_decisions(tmp_path):
+    """旧库的 verification_decisions 行没有首次响应快照列：0017 追加列后按决定
+    类型回填——approve -> completed + 分片当前摘要；reject -> pending/NULL；
+    迁移幂等，且既有决定行原样保留、服务可在迁移后启动。"""
+    import hashlib
+
+    path = tmp_path / "legacy-decisions.db"
+    seed = sqlite3.connect(path)
+    seed.executescript(
+        """
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY, total_chunks INTEGER NOT NULL,
+    file_digest TEXT NOT NULL, digest_algorithm TEXT NOT NULL DEFAULT 'sha256',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL, finalized_at TEXT
+);
+CREATE TABLE chunks (
+    session_id TEXT NOT NULL, chunk_index INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending', lease_token TEXT,
+    lease_expires_at TEXT, chunk_digest TEXT, completed_at TEXT,
+    PRIMARY KEY (session_id, chunk_index)
+);
+CREATE TABLE verification_decisions (
+    token_hash TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL, decision TEXT NOT NULL, decided_at TEXT NOT NULL,
+    FOREIGN KEY (session_id, chunk_index)
+        REFERENCES chunks(session_id, chunk_index)
+);
+INSERT INTO sessions (id, total_chunks, file_digest, digest_algorithm, status, created_at)
+    VALUES ('s1', 2, 'dig', 'sha256', 'active', '2026-01-01T00:00:00+00:00');
+INSERT INTO chunks (session_id, chunk_index, status, chunk_digest, completed_at)
+    VALUES ('s1', 0, 'completed', 'aa-digest', '2026-01-02T00:00:00+00:00');
+INSERT INTO chunks (session_id, chunk_index, status, chunk_digest, completed_at)
+    VALUES ('s1', 1, 'pending', NULL, NULL);
+INSERT INTO verification_decisions
+    (token_hash, session_id, chunk_index, decision, decided_at) VALUES
+    ('th-approve', 's1', 0, 'approve', '2026-01-03T00:00:00+00:00'),
+    ('th-reject', 's1', 1, 'reject', '2026-01-04T00:00:00+00:00');
+        """
+    )
+    seed.commit()
+    seed.close()
+
+    conn = _migrate(path)
+    assert db.LATEST_VERSION >= 17
+    assert 17 in _recorded(conn)
+
+    rows = {r[0]: (r[1], r[2]) for r in conn.execute(
+        "SELECT token_hash, result_status, result_chunk_digest"
+        " FROM verification_decisions ORDER BY token_hash")}
+    assert rows["th-approve"] == ("completed", "aa-digest")
+    assert rows["th-reject"] == ("pending", None)
+
+    # 回填的列可直接服务重放查询；再次启动幂等、不重复回填、不报错
+    conn.execute(
+        "UPDATE chunks SET chunk_digest = 'changed' WHERE session_id = 's1'"
+        " AND chunk_index = 0")
+    conn.commit()
+    db.run_migrations(conn)
+    snap = conn.execute(
+        "SELECT result_status, result_chunk_digest FROM verification_decisions"
+        " WHERE token_hash = 'th-approve'").fetchone()
+    assert tuple(snap) == ("completed", "aa-digest")  # 回填值不被二次迁移覆盖
+    conn.close()
+
+
+def test_v17_snapshot_columns_exist_on_fresh_database(tmp_path):
+    conn = _migrate(tmp_path / "fresh-v17.db")
+    cols = {r[1] for r in conn.execute(
+        "PRAGMA table_info(verification_decisions)")}
+    assert {"result_status", "result_chunk_digest"} <= cols
+    # 空库上回填语句为 0 行更新，版本仍正常登记
+    assert _recorded(conn)[17] == db._MIGRATIONS_BY_VERSION[17].checksum
+    assert db._MIGRATIONS_BY_VERSION[17].checksum == hashlib.sha256(
+        db._MIGRATIONS_BY_VERSION[17].script.encode("utf-8")).hexdigest()
+    conn.close()
+
+
 def test_migration_is_idempotent_on_repeated_startup(tmp_path):
     conn = _migrate(tmp_path / "idem.db")
     db.run_migrations(conn)

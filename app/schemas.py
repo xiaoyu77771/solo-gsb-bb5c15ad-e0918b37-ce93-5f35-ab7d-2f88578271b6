@@ -623,13 +623,18 @@ class VerificationDecideResponse(BaseModel):
     chunk_index: int
     decision: str = Field(description="本次验收决定：approve | reject")
     status: str = Field(
-        description="决定后的分片状态：approve -> completed；reject -> pending")
+        description="首次决定后的分片状态（重放保持首次值，不随后续状态变化）："
+                    " approve -> completed；reject -> pending")
     chunk_digest: Optional[str] = Field(
         default=None,
-        description="分片摘要：approve 时为通过的摘要；reject 已清除摘要，恒为 null")
+        description="首次响应时的分片摘要快照：approve 为通过的摘要；reject 恒为 null。"
+                    "重放返回该快照而非分片当前摘要（即便此后被 reopen 清除）")
     decided_at: datetime = Field(description="首次决定时间（同令牌重放保持首次值）")
     idempotent_replay: bool = Field(
-        default=False, description="是否为同一令牌同一决定的幂等重放")
+        default=False,
+        description="是否为同一令牌同一决定的幂等重放：重放始终返回首次响应快照"
+                    "（status/chunk_digest/decided_at）与 200，即使分片此后被 reopen、"
+                    "会话已取消或预留已到期")
 
 
 # ---------------------------------------------------------------- 已提交清单差异（manifest diff）

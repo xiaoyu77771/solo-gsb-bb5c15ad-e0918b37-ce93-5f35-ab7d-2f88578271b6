@@ -445,6 +445,41 @@ CREATE TABLE IF NOT EXISTS tenants (
             _index_exists("idx_sessions_tenant_state"),
         ),
     ]),
+    # 0017: 验收决定首次响应快照列。approve/reject 成功时把首次响应的
+    # status/chunk_digest 与分片状态变更写入同一事务，使同一令牌同一决定在
+    # reopen、取消或预留到期等后续状态变化后仍能返回首次结果（200）。
+    # 旧库既有的决定行没有快照：启动迁移时按决定类型回填最佳近似——
+    # approve 回填 completed 与该分片当前摘要（若摘要已被后续 reopen 清除则为 NULL，
+    # 这是旧数据信息已丢失时的保守回填），reject 回填 pending/NULL。
+    _migration(17, "verification_decisions first-response snapshot columns", [
+        ("ALTER TABLE verification_decisions ADD COLUMN result_status TEXT",
+         _column_exists("verification_decisions.result_status")),
+        ("ALTER TABLE verification_decisions ADD COLUMN result_chunk_digest TEXT",
+         _column_exists("verification_decisions.result_chunk_digest")),
+        (
+            """
+UPDATE verification_decisions
+    SET result_status = CASE decision
+            WHEN 'approve' THEN 'completed'
+            WHEN 'reject' THEN 'pending'
+        END,
+        result_chunk_digest = CASE
+            WHEN decision = 'approve' THEN (
+                SELECT c.chunk_digest FROM chunks c
+                WHERE c.session_id = verification_decisions.session_id
+                  AND c.chunk_index = verification_decisions.chunk_index
+            )
+            ELSE NULL
+        END
+    WHERE result_status IS NULL
+            """,
+            # 探测：不存在“尚未回填”的决定行时视为已完成（空表/重跑均跳过本语句）
+            lambda conn: conn.execute(
+                "SELECT 1 FROM verification_decisions"
+                " WHERE result_status IS NULL LIMIT 1"
+            ).fetchone() is None,
+        ),
+    ]),
 )
 
 LATEST_VERSION = MIGRATIONS[-1].version

@@ -549,6 +549,40 @@ def test_fault_during_verification_decide_rolls_back():
     assert chunk_row(s["id"], 0)["status"] == "completed"
 
 
+def test_fault_on_decision_insert_rolls_back_chunk_and_keeps_snapshot_atomic():
+    """快照 INSERT（决定记录）在分片 UPDATE 之后执行：若该步失败，分片状态变更
+    必须随同一事务整体回滚；重试成功后快照与分片状态一并落库，重放读取到首次快照。"""
+    drain_global_verification_queue()
+    s = make_session(total_chunks=1, verification_required=True)
+    lease_complete_awaiting(s["id"], 0)
+    vtoken = verification_lease().json()["verification_token"]
+
+    # 在决定记录 INSERT（携带快照列）上注入故障：前置的分片 UPDATE 一并回滚
+    SqlFaultInjector("INSERT INTO verification_decisions").install()
+    r = decide(s["id"], 0, vtoken, "approve")
+    assert r.status_code == 500, r.text
+    assert_connection_clean()
+    assert chunk_row(s["id"], 0)["status"] == "awaiting_verification"
+    assert get_conn().execute(
+        "SELECT COUNT(*) AS n FROM verification_decisions").fetchone()["n"] == 0
+
+    # 重试成功：分片转 completed，决定记录携带与首次响应一致的快照
+    r2 = decide(s["id"], 0, vtoken, "approve")
+    assert r2.status_code == 200, r2.text
+    snap = get_conn().execute(
+        "SELECT result_status, result_chunk_digest, decided_at"
+        " FROM verification_decisions").fetchone()
+    assert snap["result_status"] == "completed"
+    assert snap["result_chunk_digest"] == "a" * 64
+    # 重放读取快照
+    r3 = decide(s["id"], 0, vtoken, "approve")
+    assert r3.status_code == 200
+    b3 = r3.json()
+    assert b3["idempotent_replay"] is True
+    assert b3["status"] == "completed"
+    assert b3["chunk_digest"] == "a" * 64
+
+
 def test_fault_during_quota_put_rolls_back():
     tid = "tenant-tx-quota-fault"
     assert client.get(f"/tenants/{tid}/quota").status_code == 404
