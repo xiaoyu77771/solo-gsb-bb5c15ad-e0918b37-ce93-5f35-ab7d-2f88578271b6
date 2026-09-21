@@ -1,0 +1,23 @@
+services:
+  coordinator:
+    build: .
+    image: chunked-upload-coordinator
+    ports:
+      - "8000:8000"
+    environment:
+      UPLOAD_DB_PATH: /data/coordinator.db
+      DEFAULT_LEASE_TTL_SECONDS: "300"
+      MAX_LEASE_TTL_SECONDS: "3600"
+      DEFAULT_VERIFICATION_TTL_SECONDS: "300"
+      MAX_VERIFICATION_TTL_SECONDS: "3600"
+      DEFAULT_BASE_RETRY_SECONDS: "5"
+      DEFAULT_MAX_RETRY_SECONDS: "300"
+      # 容量预留 TTL：创建会话未指定时默认 24h，会话可指定的上限 7 天（秒）
+      DEFAULT_RESERVATION_TTL_SECONDS: "86400"
+      MAX_RESERVATION_TTL_SECONDS: "604800"
+    volumes:
+      - coordinator-data:/data
+    restart: unless-stopped
+
+volumes:
+  coordinator-data:
