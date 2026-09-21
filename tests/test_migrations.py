@@ -513,6 +513,118 @@ def test_lock_released_within_timeout_migration_succeeds(tmp_path, monkeypatch):
     result.close()
 
 
+# ---------------------------------------------------------------- 0017 决定快照列与旧决定回填
+
+# 0016 时代（验收决定表尚无快照列）的最小旧库：会话 + 分片 + 三枚已用过的验收令牌决定。
+# 分别覆盖：approve 后分片仍 completed（可复原快照）、reject 后分片已重新流转（pending，
+# 摘要不可复原）、approve 后分片被 reopen（现态 pending，摘要已清除）。
+V16_DECISIONS_SCHEMA = """
+CREATE TABLE sessions (
+    id TEXT PRIMARY KEY, total_chunks INTEGER NOT NULL,
+    file_digest TEXT NOT NULL, digest_algorithm TEXT NOT NULL DEFAULT 'sha256',
+    status TEXT NOT NULL DEFAULT 'active',
+    max_active_leases INTEGER,
+    base_retry_seconds INTEGER NOT NULL DEFAULT 5,
+    max_retry_seconds INTEGER NOT NULL DEFAULT 300,
+    revision INTEGER NOT NULL DEFAULT 0,
+    source_session_id TEXT,
+    created_at TEXT NOT NULL, finalized_at TEXT,
+    verification_required INTEGER NOT NULL DEFAULT 0,
+    tenant_id TEXT, declared_bytes INTEGER NOT NULL DEFAULT 0,
+    reservation_expires_at TEXT, cancelled_at TEXT
+);
+CREATE TABLE chunks (
+    session_id TEXT NOT NULL, chunk_index INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending', lease_token TEXT,
+    lease_expires_at TEXT, chunk_digest TEXT, completed_at TEXT,
+    failure_count INTEGER NOT NULL DEFAULT 0, backoff_until TEXT,
+    PRIMARY KEY (session_id, chunk_index)
+);
+CREATE TABLE verification_decisions (
+    token_hash TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+    chunk_index INTEGER NOT NULL, decision TEXT NOT NULL, decided_at TEXT NOT NULL,
+    FOREIGN KEY (session_id, chunk_index)
+        REFERENCES chunks(session_id, chunk_index)
+);
+INSERT INTO sessions (id, total_chunks, file_digest, status, created_at,
+                      verification_required)
+    VALUES ('s1', 3, 'dig', 'active', '2026-01-01T00:00:00+00:00', 1);
+INSERT INTO chunks (session_id, chunk_index, status, chunk_digest, completed_at)
+    VALUES ('s1', 0, 'completed', 'aa', '2026-01-01T00:00:00+00:00'),
+           ('s1', 1, 'pending', NULL, NULL),
+           ('s1', 2, 'pending', NULL, NULL);
+INSERT INTO verification_decisions
+    (token_hash, session_id, chunk_index, decision, decided_at)
+    VALUES ('h-approve', 's1', 0, 'approve', '2026-01-02T00:00:00+00:00'),
+           ('h-reject',  's1', 1, 'reject',  '2026-01-03T00:00:00+00:00'),
+           ('h-reopen',  's1', 2, 'approve', '2026-01-04T00:00:00+00:00');
+"""
+
+
+def test_v17_backfills_snapshot_columns_for_legacy_decisions(tmp_path):
+    path = tmp_path / "decisions_v16.db"
+    seed = sqlite3.connect(path)
+    seed.executescript(V16_DECISIONS_SCHEMA)
+    seed.commit()
+    seed.close()
+
+    conn = _migrate(path)
+    assert 17 in _recorded(conn)
+
+    # 快照列已补出
+    cols = {r[1] for r in conn.execute(
+        "PRAGMA table_info(verification_decisions)")}
+    assert {"result_status", "result_digest"} <= cols
+
+    rows = {r[0]: (r[1], r[2], r[3]) for r in conn.execute(
+        "SELECT token_hash, decision, result_status, result_digest"
+        " FROM verification_decisions")}
+    # approve 且仍 completed：按现态复原为 completed + 当时摘要
+    assert rows["h-approve"] == ("approve", "completed", "aa")
+    # reject：快照恒为 pending / NULL，与现态（pending）一致
+    assert rows["h-reject"] == ("reject", "pending", None)
+    # approve 后被 reopen：现态已是 pending 且摘要清空，尽力回填 pending / NULL
+    # （历史快照无法复原；服务正常启动，不拒绝迁移）
+    assert rows["h-reopen"] == ("approve", "pending", None)
+
+    # 决定记录本身不被改动（decision/decided_at 原样保留）
+    assert conn.execute(
+        "SELECT decided_at FROM verification_decisions WHERE token_hash='h-approve'"
+    ).fetchone()[0] == "2026-01-02T00:00:00+00:00"
+
+    # 再启动幂等：不会重复回填、不报错
+    db.run_migrations(conn)
+    assert conn.execute(
+        "SELECT count(*) FROM verification_decisions WHERE result_status IS NULL"
+    ).fetchone()[0] == 0
+    conn.close()
+
+
+def test_v17_fresh_database_starts_with_snapshot_columns_and_service_queries(tmp_path):
+    """空库迁到最新后，决定快照列齐全；模拟首次 decide 写入与重放读取。"""
+    conn = _migrate(tmp_path / "fresh17.db")
+    cols = {r[1] for r in conn.execute(
+        "PRAGMA table_info(verification_decisions)")}
+    assert {"result_status", "result_digest"} <= cols
+
+    conn.execute(
+        "INSERT INTO sessions (id, total_chunks, file_digest, status, created_at)"
+        " VALUES ('sid', 1, 'dig', 'active', '2026-01-01T00:00:00+00:00')")
+    conn.execute(
+        "INSERT INTO chunks (session_id, chunk_index) VALUES ('sid', 0)")
+    conn.execute(
+        "INSERT INTO verification_decisions (token_hash, session_id, chunk_index,"
+        " decision, decided_at, result_status, result_digest)"
+        " VALUES ('h', 'sid', 0, 'approve', '2026-01-01T00:00:00+00:00',"
+        " 'completed', 'digest')")
+    conn.commit()
+    row = conn.execute(
+        "SELECT result_status, result_digest FROM verification_decisions"
+        " WHERE token_hash='h'").fetchone()
+    assert tuple(row) == ("completed", "digest")
+    conn.close()
+
+
 # ---------------------------------------------------------------- 进程级启动路径
 
 def test_get_conn_rejects_startup_on_future_version(tmp_path, monkeypatch):

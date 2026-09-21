@@ -26,12 +26,12 @@ docker compose up --build
 ## 数据库版本化迁移（启动时自动执行）
 
 数据库结构由代码内一组**固定顺序、不可变**的版本化迁移脚本定义（`app/db.py`
-中的 `MIGRATIONS`，当前最新版本 16）。每次启动时迁移器在**一笔
+中的 `MIGRATIONS`，当前最新版本 17）。每次启动时迁移器在**一笔
 `BEGIN IMMEDIATE` 事务**内完成收敛，三种库最终得到完全一致的最新结构：
 
 | 启动时的库 | 行为 |
 |---|---|
-| 空库（首次启动） | 按版本 1 → 16 顺序执行全部脚本，逐版本写入 `schema_migrations` |
+| 空库（首次启动） | 按版本 1 → 17 顺序执行全部脚本，逐版本写入 `schema_migrations` |
 | 旧库（按列探测时代创建，无 `schema_migrations` 表） | 逐版本探测已有表/列/索引：已存在的结构只登记版本不执行，缺失部分补齐；**既有数据、索引与外键原样保留** |
 | 已纳管库（再次启动） | 校验已记录版本后只执行新增版本；无新增时纯校验后启动 |
 
@@ -197,9 +197,18 @@ pending --(领取上传租约)--> leased --(complete：令牌+摘要匹配)--> a
     上传租约与退避冷却，**保留累计失败次数**），可立即重新领取上传租约重传；
   - 令牌必须是该分片**当前未过期**的验收令牌：未知/不匹配/已过期/已被换发均 `409`；
     分片已不在待验收状态返回 `409`；会话或分片不存在返回 `404`。
-  - **同一令牌同一决定重放幂等**：返回首次结果（`idempotent_replay: true`、首次的
-    `decided_at` 与分片状态），并发重放同样安全；**同一令牌携带冲突决定返回 `409`**
-    （响应体带首次的 `original_decision`），分片维持首次决定结果。
+  - **同一令牌同一决定重放幂等**：首次成功响应（决定后的 `status`、`chunk_digest`、
+    `decided_at`）在决定落库的同一事务内作为**快照**持久化；之后无论分片现态如何变化
+    （approve 后被 `reopen` 回退、会话取消或预留到期、reject 后分片被重新上传等），
+    同一令牌同一决定的重放（含并发重试）始终返回 **HTTP 200 与首次快照**
+    （`idempotent_replay: true`），不重读分片现态、不触发预留到期惰性取消；
+    **同一令牌携带冲突决定返回 `409`**（响应体带首次的 `original_decision`），
+    分片维持首次决定结果；
+  - 重放校验在所有现态校验**之前**：只要令牌已有决定记录且 URL 指向其首次决定的
+    (会话, 分片)，同决定即返回首次快照；令牌用于其他分片/会话仍为 `409`；
+  - 升级兼容性：旧版本写入的决定记录没有快照列，启动时追加式迁移（`0017`）自动补列
+    并按分片现态尽力回填（仍 `completed` 的 approve 可复原摘要；reject 恒为
+    `pending`/`null`；approve 后已 reopen 的历史行回填 `pending`/`null`），服务正常启动。
 - **进度分支**：fork 复制会话的 `verification_required` 开关；待验收分片不属于
   `completed`，不能作为 `reuse_chunks` 复用（返回 `409 not_completed_chunks`）。
 - **未启用会话完全不受影响**：complete 直接 `completed`，`/verifications/lease` 在全局
@@ -245,6 +254,21 @@ curl -s -X POST http://localhost:8000/verifications/$SID/0/decide \
   -H 'Content-Type: application/json' \
   -d "{\"verification_token\": \"$VTOKEN\", \"decision\": \"reject\"}"
 # => {"decision": "reject", "status": "pending", "chunk_digest": null, ...}
+
+# 4c. 幂等重放语义：approve 成功后即使分片现态发生变化（reopen 回退、会话取消/预留
+#     到期、reject 后重新上传等），同一令牌同一决定始终返回首次 200 快照
+curl -s -X POST http://localhost:8000/verifications/$SID/0/decide \
+  -H 'Content-Type: application/json' \
+  -d "{\"verification_token\": \"$VTOKEN\", \"decision\": \"approve\"}"
+# => 200（首次快照）
+# {"decision": "approve", "status": "completed",
+#  "chunk_digest": "<分片0首次摘要>", "decided_at": "<首次决定时间>",
+#  "idempotent_replay": true}
+# 同一令牌携带冲突决定仍为 409（响应体带 original_decision）
+curl -s -X POST http://localhost:8000/verifications/$SID/0/decide \
+  -H 'Content-Type: application/json' \
+  -d "{\"verification_token\": \"$VTOKEN\", \"decision\": \"reject\"}"
+# => 409 {"detail": "...conflicting decision", "original_decision": "approve"}
 
 # 5. 状态与就绪查询区分待验收分片
 curl -s http://localhost:8000/sessions/$SID
@@ -451,7 +475,7 @@ curl -s -X POST http://localhost:8000/sessions/$SID/finalize
 | `POST` | `/delivery-tickets/revoke` | 撤销未消费凭证（已消费不可撤销；重复撤销幂等，撤销后不可兑换） |
 | `POST` | `/manifests/diff` | 比较两个已提交会话的按序分片清单：返回插入+删除次数之和最小的编辑脚本（多解时固定优先删除再插入），连续同类操作合并为携带半开区间与摘要的区段；`404`/`409`/`422` |
 | `POST` | `/verifications/lease` | 按完成时间 FIFO 领取一个待验收分片并签发有 TTL 的验收令牌（未过期独占、过期可重领、并发不重复） |
-| `POST` | `/verifications/{session_id}/{chunk_index}/decide` | 凭当前验收令牌 approve（转 completed）或 reject（清除摘要回 pending）；同令牌同决定幂等、冲突决定 409 |
+| `POST` | `/verifications/{session_id}/{chunk_index}/decide` | 凭当前验收令牌 approve（转 completed）或 reject（清除摘要回 pending）；首次响应随决定同事务快照持久化，同令牌同决定在任何后续状态变化后重放均返回首次 200、冲突决定 409 |
 | `GET` | `/healthz` | 健康检查 |
 
 ## 批量领取与并发上限（curl）

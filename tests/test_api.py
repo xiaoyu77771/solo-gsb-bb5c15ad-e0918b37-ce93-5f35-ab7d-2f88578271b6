@@ -2996,6 +2996,108 @@ def test_decide_token_bound_to_its_own_chunk_and_session():
     assert decide(s2["id"], 0, g0["verification_token"], "approve").status_code == 409
 
 
+def test_decide_replay_returns_first_snapshot_after_reopen():
+    # approve 后分片被 reopen 回 pending：同令牌同决定重放仍返回首次的
+    # completed + 首次摘要 + 首次 decided_at（而非重读现态得到 pending）
+    s = make_verification_session(total_chunks=1)
+    upload_token = lease(s["id"], 0).json()["lease_token"]
+    digest = f"{0:064d}"
+    complete(s["id"], 0, upload_token, digest)
+    g = verification_lease().json()
+    r1 = decide(s["id"], 0, g["verification_token"], "approve")
+    assert r1.status_code == 200
+    b1 = r1.json()
+    assert b1["status"] == "completed" and b1["chunk_digest"] == digest
+
+    # reopen 把已完成分片重置为 pending（清除摘要/完成时间）
+    rr = reopen(s["id"], 0, upload_token, digest)
+    assert rr.status_code == 200, rr.text
+    st = client.get(f"/sessions/{s['id']}").json()
+    assert st["chunks"][0]["status"] == "pending"
+    assert st["chunks"][0]["chunk_digest"] is None
+
+    r2 = decide(s["id"], 0, g["verification_token"], "approve")
+    assert r2.status_code == 200
+    b2 = r2.json()
+    assert b2["idempotent_replay"] is True
+    assert b2["status"] == "completed"            # 首次快照，不随现态变为 pending
+    assert b2["chunk_digest"] == digest          # 首次摘要，不随现态被清空
+    assert b2["decided_at"] == b1["decided_at"]
+
+
+def test_decide_replay_returns_first_snapshot_after_session_cancel():
+    # approve 后整个会话被取消（completed 分片摘要保留审计）：重放仍 200 返回首次快照，
+    # 不返回“session is cancelled”409，也不依赖分片现态
+    s = make_verification_session(total_chunks=1)
+    lease_complete_awaiting(s["id"], 0)
+    g = verification_lease().json()
+    b1 = decide(s["id"], 0, g["verification_token"], "approve").json()
+
+    assert cancel(s["id"]).status_code == 200
+    assert client.get(f"/sessions/{s['id']}").json()["status"] == "cancelled"
+
+    r2 = decide(s["id"], 0, g["verification_token"], "approve")
+    assert r2.status_code == 200
+    b2 = r2.json()
+    assert b2["idempotent_replay"] is True
+    assert b2["status"] == "completed"
+    assert b2["chunk_digest"] == b1["chunk_digest"]
+    assert b2["decided_at"] == b1["decided_at"]
+    # 冲突决定仍为 409，响应体带首次决定
+    rc = decide(s["id"], 0, g["verification_token"], "reject")
+    assert rc.status_code == 409
+    assert rc.json()["original_decision"] == "approve"
+
+
+def test_decide_replay_returns_first_snapshot_after_reservation_expiry():
+    # approve 之后预留才到期：重放不触发惰性取消、不返回 409，仍返回首次 200 快照
+    s = make_verification_session(total_chunks=1)
+    lease_complete_awaiting(s["id"], 0)
+    g = verification_lease().json()
+    b1 = decide(s["id"], 0, g["verification_token"], "approve").json()
+
+    expire_reservation(s["id"])
+    r2 = decide(s["id"], 0, g["verification_token"], "approve")
+    assert r2.status_code == 200
+    b2 = r2.json()
+    assert b2["status"] == "completed"
+    assert b2["chunk_digest"] == b1["chunk_digest"]
+    assert b2["decided_at"] == b1["decided_at"]
+    assert b2["idempotent_replay"] is True
+    # 会话未因重放而被惰性取消（重放不产生任何副作用）
+    assert get_conn().execute(
+        "SELECT status FROM sessions WHERE id = ?", (s["id"],)
+    ).fetchone()["status"] == "active"
+
+
+def test_decide_replay_after_reject_returns_first_pending_snapshot():
+    # reject 后分片被重新上传（新摘要、再次待验收乃至被新令牌 approve）：
+    # 旧令牌同决定重放仍返回首次 reject 的 pending/null/首次 decided_at
+    s = make_verification_session(total_chunks=1)
+    lease_complete_awaiting(s["id"], 0, digest="1" * 64)
+    g1 = verification_lease().json()
+    r1 = decide(s["id"], 0, g1["verification_token"], "reject")
+    assert r1.status_code == 200
+    b1 = r1.json()
+    assert b1["status"] == "pending" and b1["chunk_digest"] is None
+
+    # 重新上传并以新验收令牌 approve：分片现态为 completed、摘要是新摘要
+    token = lease(s["id"], 0).json()["lease_token"]
+    complete(s["id"], 0, token, "2" * 64)
+    g2 = verification_lease().json()
+    assert decide(s["id"], 0, g2["verification_token"], "approve").status_code == 200
+
+    r2 = decide(s["id"], 0, g1["verification_token"], "reject")
+    assert r2.status_code == 200
+    b2 = r2.json()
+    assert b2["idempotent_replay"] is True
+    assert b2["status"] == "pending"          # 首次 reject 快照
+    assert b2["chunk_digest"] is None
+    assert b2["decided_at"] == b1["decided_at"]
+    # 旧令牌携带冲突决定仍 409
+    assert decide(s["id"], 0, g1["verification_token"], "approve").status_code == 409
+
+
 def test_verification_ignores_non_verification_sessions():
     s = make_session(total_chunks=2)
     token = lease(s["id"], 0).json()["lease_token"]

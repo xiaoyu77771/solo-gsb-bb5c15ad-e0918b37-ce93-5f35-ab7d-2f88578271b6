@@ -445,6 +445,46 @@ CREATE TABLE IF NOT EXISTS tenants (
             _index_exists("idx_sessions_tenant_state"),
         ),
     ]),
+    # 0017: 验收决定的首次响应快照。重放必须返回首次决定落库时的结果（状态与摘要），
+    # 不能重读分片现态——approve 后 reopen、会话取消或 reject 后重新上传都会改写现态，
+    # 导致同一令牌同一决定无法原样返回。新增两列保存首次快照；旧库既有决定行在同一
+    # 迁移事务内按分片现态尽力回填（approve 且仍 completed 的可取到当时摘要；其余
+    # 情形，尤其是 reject 后摘要已清除，只能回填 status、摘要为 NULL，与 reject 的
+    # 快照一致；无法复原的 approve 摘要同样置 NULL，服务仍可正常启动）。
+    _migration(17, "verification_decisions first response snapshot", [
+        ("ALTER TABLE verification_decisions ADD COLUMN result_status TEXT",
+         _column_exists("verification_decisions.result_status")),
+        ("ALTER TABLE verification_decisions ADD COLUMN result_digest TEXT",
+         _column_exists("verification_decisions.result_digest")),
+        # 回填幂等闸门：已存在决定行且快照已全部落值则跳过。空库上 verification_decisions
+        # 不存在，_table_exists 探测直接为真（跳过）；旧库首次执行时表存在但新列刚由
+        # 上面两条 ALTER 补出，存在未回填行（result_status IS NULL），执行一次回填。
+        (
+            """
+UPDATE verification_decisions
+SET result_status = (
+        SELECT CASE WHEN c.status = 'completed' THEN 'completed' ELSE 'pending' END
+        FROM chunks AS c
+        WHERE c.session_id = verification_decisions.session_id
+          AND c.chunk_index = verification_decisions.chunk_index
+    ),
+    result_digest = (
+        SELECT CASE WHEN c.status = 'completed' THEN c.chunk_digest ELSE NULL END
+        FROM chunks AS c
+        WHERE c.session_id = verification_decisions.session_id
+          AND c.chunk_index = verification_decisions.chunk_index
+    )
+WHERE result_status IS NULL
+            """,
+            lambda conn: (
+                not _table_exists("verification_decisions")(conn)
+                or conn.execute(
+                    "SELECT 1 FROM verification_decisions"
+                    " WHERE result_status IS NULL LIMIT 1"
+                ).fetchone() is None
+            ),
+        ),
+    ]),
 )
 
 LATEST_VERSION = MIGRATIONS[-1].version

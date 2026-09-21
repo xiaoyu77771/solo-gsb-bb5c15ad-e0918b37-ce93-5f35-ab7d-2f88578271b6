@@ -549,6 +549,35 @@ def test_fault_during_verification_decide_rolls_back():
     assert chunk_row(s["id"], 0)["status"] == "completed"
 
 
+def test_fault_on_decision_insert_rolls_back_chunk_status_and_snapshot():
+    # 决定顺序：分片 UPDATE -> 决定 INSERT（含首次响应快照）-> 验收租约 DELETE；
+    # 在决定 INSERT 处注入故障：分片状态与快照必须一同回滚，重试后首次响应才完整
+    drain_global_verification_queue()
+    s = make_session(total_chunks=1, verification_required=True)
+    lease_complete_awaiting(s["id"], 0)
+    vtoken = verification_lease().json()["verification_token"]
+
+    SqlFaultInjector("INSERT INTO verification_decisions").install()
+    r = decide(s["id"], 0, vtoken, "approve")
+    assert r.status_code == 500, r.text
+    assert_connection_clean()
+    assert chunk_row(s["id"], 0)["status"] == "awaiting_verification"
+    assert get_conn().execute(
+        "SELECT COUNT(*) AS n FROM verification_decisions").fetchone()["n"] == 0
+    assert get_conn().execute(
+        "SELECT COUNT(*) AS n FROM verification_leases WHERE session_id = ?",
+        (s["id"],)).fetchone()["n"] == 1
+
+    # 重试成功：分片转 completed，决定记录与首次快照一并落库
+    r2 = decide(s["id"], 0, vtoken, "approve")
+    assert r2.status_code == 200, r2.text
+    row = get_conn().execute(
+        "SELECT decision, result_status, result_digest FROM verification_decisions"
+        " WHERE session_id = ? AND chunk_index = 0",
+        (s["id"],)).fetchone()
+    assert tuple(row) == ("approve", "completed", "a" * 64)
+
+
 def test_fault_during_quota_put_rolls_back():
     tid = "tenant-tx-quota-fault"
     assert client.get(f"/tenants/{tid}/quota").status_code == 404

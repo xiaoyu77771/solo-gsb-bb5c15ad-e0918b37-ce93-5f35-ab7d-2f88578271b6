@@ -35,7 +35,9 @@
   签发有 TTL 的验收令牌（仅存 SHA-256），未过期独占、过期可重领、并发请求不会重复领取；
   POST /verifications/{session_id}/{chunk_index}/decide 携带当前令牌 approve 或 reject：
   approve 转 completed，reject 在同一事务内原子清除摘要并回到 pending（可重新上传）；
-  同一令牌同一决定重放幂等、冲突决定返回 409。未启用会话保持原行为
+  首次响应（status/chunk_digest/decided_at）随决定同事务快照持久化，同一令牌同一决定
+  即使在 reopen、取消或预留到期等后续状态变化后重放，仍返回首次 200 快照；冲突决定 409。
+  未启用会话保持原行为
 - 跨会话公平调度：POST /dispatch/lease 携带 queue_key、候选 session_ids 与 lease_ttl_seconds；
   候选会话去重后按（创建时间, id）稳定排序，服务端按 queue_key 持久化最近一次成功会话，
   在同一写锁事务内从其后循环扫描，从首个存在可领取分片且仍有并发槽位的会话领取序号最低的
@@ -2290,14 +2292,18 @@ def lease_verification(req: Optional[VerificationLeaseRequest] = Body(default=No
 def decide_verification(session_id: str, chunk_index: int, req: VerificationDecideRequest):
     """在同一 DB_LOCK 写事务内校验并落决定：
 
-    - 幂等优先：同一验收令牌 + 同一决定重放（含并发重试）原样返回首次结果；
-      同一令牌携带冲突决定返回 409（一枚令牌只能作一次决定）；
-    - 分片必须仍为 awaiting_verification；令牌须为该分片当前（未过期）验收令牌，
-      否则返回 409（令牌不匹配/已过期/已被新令牌换发）；
+    - 幂等最优先：先按令牌哈希查决定记录，再做任何分片现态/会话状态校验。同一验收
+      令牌 + 同一决定重放（含 approve 后 reopen、会话取消或预留到期、reject 后重新
+      上传等后续状态变化，也含并发重试）原样返回**首次响应快照**（首次的 status、
+      chunk_digest、decided_at）；同一令牌携带冲突决定返回 409（一枚令牌只能作一次
+      决定）；令牌绑定其首次决定的 (session, chunk)，用于其他 URL 一律 409；
+    - 首次决定：分片必须仍为 awaiting_verification；令牌须为该分片当前（未过期）验收
+      令牌，否则返回 409（令牌不匹配/已过期/已被新令牌换发）；
     - approve：分片转 completed（摘要与完成时间沿用完成上报值）；
     - reject：原子清除摘要与完成时间、分片回到 pending（同时清除上传租约与退避冷却，
       保留累计失败次数），可立即重新领取上传租约重传。
-    成功后删除该分片的当前验收租约行，并写入按令牌哈希唯一的决定记录。
+    成功后删除该分片的当前验收租约行，并写入按令牌哈希唯一的决定记录及其首次响应
+    快照（result_status/result_digest）。
     """
     now = utcnow()
     token_hash = hash_verification_token(req.verification_token)
@@ -2306,12 +2312,8 @@ def decide_verification(session_id: str, chunk_index: int, req: VerificationDeci
         session = get_session_or_404(session_id)
         chunk = get_chunk_or_404(session_id, chunk_index)
 
-        # 预留到期惰性取消；已取消/到期会话的待验收分片不可再被验收
-        session = expire_session_if_due(session, now)
-        if session["status"] == SESSION_STATUS_CANCELLED:
-            raise HTTPException(
-                status_code=409, detail="session is cancelled or reservation expired")
-
+        # 幂等优先于一切现态校验：决定记录是首次响应的唯一事实来源，重放不重读分片
+        # 现态，也不触发预留到期惰性取消，保证后续 reopen/取消/到期后仍返回首次结果。
         decision_row = conn.execute(
             "SELECT * FROM verification_decisions WHERE token_hash = ?",
             (token_hash,),
@@ -2322,26 +2324,29 @@ def decide_verification(session_id: str, chunk_index: int, req: VerificationDeci
                     or decision_row["chunk_index"] != chunk_index):
                 raise HTTPException(
                     status_code=409, detail="verification token mismatch")
-            # 同枚令牌已有决定：同决定幂等返回首次结果，不同决定冲突
+            # 同枚令牌已有决定：同决定幂等返回首次快照，不同决定冲突
             if decision_row["decision"] != req.decision:
                 conflict(
                     "verification token already used with a conflicting decision",
                     original_decision=decision_row["decision"],
                 )
-            current = conn.execute(
-                "SELECT status, chunk_digest FROM chunks"
-                " WHERE session_id = ? AND chunk_index = ?",
-                (session_id, chunk_index),
-            ).fetchone()
             return VerificationDecideResponse(
                 session_id=session_id,
                 chunk_index=chunk_index,
                 decision=req.decision,
-                status=current["status"],
-                chunk_digest=current["chunk_digest"],
+                status=decision_row["result_status"],
+                chunk_digest=decision_row["result_digest"],
                 decided_at=parse_ts(decision_row["decided_at"]),
                 idempotent_replay=True,
             )
+
+        # 预留到期惰性取消；已取消/到期会话的待验收分片不可再被验收。
+        # 仅在令牌从未作过决定时执行：已有决定的重放必须原样返回首次结果，
+        # 不能被取消/到期拦截（惰性取消的清理也不得借重放请求触发）。
+        session = expire_session_if_due(session, now)
+        if session["status"] == SESSION_STATUS_CANCELLED:
+            raise HTTPException(
+                status_code=409, detail="session is cancelled or reservation expired")
 
         if chunk["status"] != CHUNK_STATUS_AWAITING_VERIFICATION:
             raise HTTPException(
@@ -2380,16 +2385,19 @@ def decide_verification(session_id: str, chunk_index: int, req: VerificationDeci
             chunk_update_args = (session_id, chunk_index)
             result_digest = None
 
-        # 分片状态、决定记录、验收租约删除为一笔事务：中途异常整体回滚，
-        # 不会出现“决定已落库但分片仍待验收”等半成品
+        # 分片状态、决定记录（含首次响应快照）、验收租约删除为一笔事务：中途异常整体
+        # 回滚，不会出现“决定已落库但分片仍待验收”或“快照缺失”的半成品
         with locked_transaction() as write_conn:
             write_conn.execute(chunk_update_sql, chunk_update_args)
-            # 决定落库（token_hash 主键保证一枚令牌至多一个决定），随后删除当前验收租约
+            # 决定落库（token_hash 主键保证一枚令牌至多一个决定）并保存首次响应快照，
+            # 随后删除当前验收租约
             write_conn.execute(
                 "INSERT INTO verification_decisions"
-                " (token_hash, session_id, chunk_index, decision, decided_at)"
-                " VALUES (?, ?, ?, ?, ?)",
-                (token_hash, session_id, chunk_index, req.decision, now.isoformat()),
+                " (token_hash, session_id, chunk_index, decision, decided_at,"
+                " result_status, result_digest)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (token_hash, session_id, chunk_index, req.decision, now.isoformat(),
+                 new_status, result_digest),
             )
             write_conn.execute(
                 "DELETE FROM verification_leases WHERE session_id = ? AND chunk_index = ?",
